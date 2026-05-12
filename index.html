@@ -483,11 +483,15 @@ html,body { height:100%; background:var(--bg); color:var(--text); font-family:'D
 <div class="toast" id="toast"></div>
 
 <script>
+// ── CONFIG ──
+// Ganti dengan URL deployment Google Apps Script kamu
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbyaDbQFw1SgBjarC1CWaFxgDJGjOS4NWQNTciBE83K2Gez_nXWFYd8uXKOSfiiv5TWP/exec';
+
 // ── STATE ──
 const ACCOUNTS = [
-  { name:'Toko Berkah Jaya', pin:'1234', budget:1000 },
-  { name:'CV Maju Bersama',  pin:'5678', budget:2000 },
-  { name:'Warung Bu Siti',   pin:'0000', budget:500  },
+  { id:'BIZ-001', name:'Toko Berkah Jaya', pin:'1234', budget:1000 },
+  { id:'BIZ-002', name:'CV Maju Bersama',  pin:'5678', budget:2000 },
+  { id:'BIZ-003', name:'Warung Bu Siti',   pin:'0000', budget:500  },
 ];
 const CAT_COLORS = {
   'Operational':'#7C6AF7','Supplies':'#60A5FA',
@@ -516,16 +520,42 @@ function showScreen(id) {
 }
 
 // ── AUTH ──
-function doLogin() {
+async function doLogin() {
   const name = document.getElementById('l-name').value.trim();
   const pin  = document.getElementById('l-pin').value.trim();
   if (!name || !pin) { showToast('Please fill all fields'); return; }
-  const acc = ACCOUNTS.find(a => a.name.toLowerCase() === name.toLowerCase() && a.pin === pin);
+
+  const btn = document.querySelector('.btn-login');
+  btn.textContent = 'Signing in...'; btn.disabled = true;
+
+  // Coba login via GAS dulu, fallback ke local jika GAS belum disetup
+  let acc = null;
+  try {
+    const res = await fetch(GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'login', biz_name: name, pin })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      acc = { id: data.business.id, name: data.business.name, budget: data.business.budget };
+    }
+  } catch(e) {
+    // GAS belum disetup — pakai local accounts
+    acc = ACCOUNTS.find(a => a.name.toLowerCase() === name.toLowerCase() && a.pin === pin);
+  }
+
+  btn.textContent = 'Sign In →'; btn.disabled = false;
+
   if (!acc) { showToast('Business name or PIN incorrect'); return; }
+
   currentUser = acc;
   const now = new Date();
   document.getElementById('dn-month').textContent = now.toLocaleString('en',{month:'long',year:'numeric'});
   document.getElementById('dn-av').textContent = acc.name.charAt(0).toUpperCase();
+  
+  // Load dashboard data dari GAS
+  await loadDashboardFromGAS();
   updateDashboard();
   showScreen('dashboard');
 }
@@ -534,7 +564,38 @@ function doLogout() {
   if(confirm('Sign out?')) { currentUser=null; showScreen('login'); }
 }
 
-// ── DASHBOARD ──
+// Load dashboard data dari GAS
+async function loadDashboardFromGAS() {
+  if (!currentUser) return;
+  try {
+    const res  = await fetch(`${GAS_URL}?action=get_dashboard&biz_name=${encodeURIComponent(currentUser.name)}`);
+    const data = await res.json();
+    if (data.ok && data.summary) {
+      // Sync budget dari GAS
+      currentUser.budget    = data.summary.budget_month || currentUser.budget;
+      // Sync expenses dari GAS ke local state
+      if (data.recent && data.recent.length) {
+        expenses = data.recent.map(e => ({
+          cat   : e.cat,
+          icon  : CAT_ICONS[e.cat] || '💡',
+          desc  : e.desc,
+          amount: e.amount,
+          vendor: '',
+          wa    : '',
+          time  : e.date
+        }));
+      }
+    }
+  } catch(e) {
+    // GAS belum aktif — lanjut pakai local state
+    console.log('GAS not connected, using local state');
+  }
+}
+
+const CAT_ICONS = {
+  'Operational':'⚙️','Supplies':'📦','Marketing':'📣',
+  'Transport':'🚗','Meals':'🍱','Other':'💡'
+};
 function updateDashboard() {
   const total = expenses.reduce((s,e)=>s+e.amount,0);
   const budget = currentUser?.budget || 1000;
@@ -646,40 +707,92 @@ function setAmt(val) {
 
 function clearQA() { document.querySelectorAll('.qa-btn').forEach(b=>b.classList.remove('active')); }
 
-function submitExpense() {
-  const desc = document.getElementById('f-desc').value.trim();
-  const amount = parseFloat(document.getElementById('f-amount').value)||0;
+async function submitExpense() {
+  const desc   = document.getElementById('f-desc').value.trim();
+  const amount = parseFloat(document.getElementById('f-amount').value) || 0;
   const vendor = document.getElementById('f-vendor').value.trim();
-  const wa = document.getElementById('f-wa').value.trim();
+  const wa     = document.getElementById('f-wa').value.trim();
+
   if (amount < 0.01) { showToast('Please enter an amount'); return; }
-  const now = new Date();
+
+  const btn = document.querySelector('.btn-submit');
+  btn.innerHTML = '⏳ Saving...'; btn.disabled = true;
+
+  const now     = new Date();
   const timeStr = now.toLocaleString('en',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+
+  // Kirim ke GAS
+  let expId = 'EXP-LOCAL-' + Date.now();
+  try {
+    const payload = {
+      action        : 'add_expense',
+      biz_id        : currentUser.id || 'BIZ-001',
+      biz_name      : currentUser.name,
+      category      : selectedCat,
+      description   : desc || selectedCat,
+      amount        : amount,
+      vendor        : vendor,
+      payment_method: 'Cash',
+      recorded_by   : currentUser.name,
+      notes         : ''
+    };
+    const res  = await fetch(GAS_URL, {
+      method : 'POST',
+      mode   : 'no-cors', // GAS perlu no-cors
+      headers: { 'Content-Type': 'application/json' },
+      body   : JSON.stringify(payload)
+    });
+    // no-cors = opaque response, anggap berhasil
+  } catch(e) {
+    console.log('GAS save error (ok jika belum setup):', e);
+  }
+
+  // Simpan local state
   const entry = { cat:selectedCat, icon:selectedIcon, desc:desc||selectedCat, amount, vendor, wa, time:timeStr };
   expenses.push(entry);
-  activeExpense = entry;
+  activeExpense = { ...entry, expId, date:timeStr };
   updateDashboard();
-  document.getElementById('s-cat').textContent = selectedCat;
+
+  // Tampil success modal
+  document.getElementById('s-cat').textContent  = selectedCat;
   document.getElementById('s-desc').textContent = desc || '—';
-  document.getElementById('s-amt').textContent = '$' + amount.toLocaleString('en',{minimumFractionDigits:2});
+  document.getElementById('s-amt').textContent  = '$' + amount.toLocaleString('en',{minimumFractionDigits:2});
   document.getElementById('s-time').textContent = timeStr;
-  document.getElementById('s-biz').textContent = currentUser?.name || '—';
+  document.getElementById('s-biz').textContent  = currentUser?.name || '—';
+
   const btnWA = document.getElementById('btn-wa-send');
-  if (wa) { btnWA.disabled=false; btnWA.innerHTML='📲 Send WA Report'; }
-  else { btnWA.disabled=true; btnWA.innerHTML='📲 WA number not filled'; }
+  if (wa) {
+    btnWA.disabled = false;
+    btnWA.innerHTML = '📲 Send WA Report';
+    btnWA.style.background = '#25D366';
+  } else {
+    btnWA.disabled = true;
+    btnWA.innerHTML = '📲 WA number not filled';
+  }
+
+  btn.innerHTML = '<span>💾</span> Save Expense';
+  btn.disabled  = false;
   document.getElementById('success-modal').classList.add('show');
 }
 
 function sendWA() {
   if (!activeExpense) return;
-  const e = activeExpense;
-  let no = e.wa.replace(/\D/g,'');
+  const e       = activeExpense;
+  const total   = expenses.reduce((s,x)=>s+x.amount,0);
+  const budget  = currentUser?.budget || 1000;
+  const remain  = Math.max(budget - total, 0);
+  const pct     = Math.round(total/budget*100);
+
+  let no = (e.wa||'').replace(/\D/g,'');
   if (no.startsWith('0')) no = '62'+no.slice(1);
   else if (no.startsWith('8')) no = '62'+no;
-  const total = expenses.reduce((s,x)=>s+x.amount,0);
+  if (!no) { showToast('No WA number'); return; }
+
+  const baris = '━━━━━━━━━━━━━━━━━━━━━━';
   const msg =
-`━━━━━━━━━━━━━━━━━━━
+`${baris}
 💸 *SpendWise Expense Report*
-━━━━━━━━━━━━━━━━━━━
+${baris}
 
 🏪 *Business* : ${currentUser?.name}
 📅 *Date*     : ${e.time}
@@ -689,18 +802,21 @@ function sendWA() {
    Item     : ${e.desc}${e.vendor ? '\n   Vendor   : '+e.vendor : ''}
    Amount   : *$${e.amount.toFixed(2)}*
 
-━━━━━━━━━━━━━━━━━━━
-💰 *Month Total : $${total.toFixed(2)}*
-📊 Budget Used  : ${Math.round(total/(currentUser?.budget||1000)*100)}%
-━━━━━━━━━━━━━━━━━━━
+${baris}
+📊 *Month Summary*
+   Total Spent : $${total.toFixed(2)}
+   Budget      : $${budget.toFixed(2)}
+   Remaining   : $${remain.toFixed(2)}
+   Used        : ${pct}%
+${baris}
 _Sent via SpendWise Expense Tracker_`;
 
   const url = `https://wa.me/${no}?text=${encodeURIComponent(msg)}`;
   const btn = document.getElementById('btn-wa-send');
   btn.innerHTML = '✅ Report Sent!';
-  btn.disabled = true;
+  btn.disabled  = true;
   btn.style.background = '#16C784';
-  window.open(url,'_blank');
+  window.open(url, '_blank');
 }
 
 function closeSuccess() {
